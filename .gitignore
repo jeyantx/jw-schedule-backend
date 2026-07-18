@@ -1,0 +1,11 @@
+# Build output
+build/
+.gradle/
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
+
+# Catalyst CLI local state
+.catalystrc
