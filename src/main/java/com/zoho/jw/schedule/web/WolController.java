@@ -1,27 +1,35 @@
 package com.zoho.jw.schedule.web;
 
+import org.springframework.http.CacheControl;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.io.InputStream;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
-import java.util.logging.Logger;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Server-side proxy for wol.jw.org, so the front-end can read Meeting-Workbook pages (to scrape the
- * weekly thumbnail image URLs) without hitting the browser's CORS wall.
+ * weekly thumbnail image URLs) and thumbnails without hitting the browser's CORS wall. All network +
+ * caching work lives in {@link WolService}; this class is the thin HTTP shell.
  *
- *   GET /wol/fetch?path=<url-encoded path> -> the upstream page body as text/plain; charset=utf-8
+ *   GET  /wol/fetch?path=<url-encoded path>  -> the upstream page body as text/plain; charset=utf-8
+ *   POST /wol/batch  {paths:[...max 20...]}  -> {jobId, total} (fetches run on a background thread,
+ *                                               surviving the ~60s request cap; client then polls)
+ *   GET  /wol/batch/{jobId}                  -> {done,total,finished,errors, results-when-finished}
+ *                                               410 when the job is unknown (instance restarted)
+ *   GET  /wol/image?path=<url-encoded path>  -> the upstream image bytes with its content-type
  *
  * The host is ALWAYS wol.jw.org — never taken from the caller. {@code path} is the part after the
  * host (leading slashes stripped); anything with a scheme ("://") or "../" traversal is rejected.
@@ -29,103 +37,85 @@ import java.util.logging.Logger;
 @RestController
 public class WolController
 {
-    private static final Logger LOGGER = Logger.getLogger(WolController.class.getName());
-
-    private static final String HOST = "https://wol.jw.org/";
-    private static final long MAX_BYTES = 3L * 1024 * 1024;   // 3MB response cap
-    private static final Duration TIMEOUT = Duration.ofSeconds(10);
-    private static final String USER_AGENT =
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-            + "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
-
-    // followRedirects(NORMAL) chases redirects; HttpClient caps a single request chain, but we also
-    // bound total time via the per-request timeout above.
-    private static final HttpClient CLIENT = HttpClient.newBuilder()
-            .followRedirects(HttpClient.Redirect.NORMAL)
-            .connectTimeout(TIMEOUT)
-            .build();
-
     private final AccessGuard guard;
+    private final WolService wol;
 
-    public WolController(AccessGuard guard)
+    public WolController(AccessGuard guard, WolService wol)
     {
         this.guard = guard;
+        this.wol = wol;
     }
 
     @GetMapping("/wol/fetch")
     public ResponseEntity<String> fetch(
             @RequestHeader(value = "X-User-Email", required = false) String email,
-            @RequestParam("path") String path) throws Exception
+            @RequestParam("path") String path)
     {
         guard.requireEmail(email);   // any signed-in user may proxy; just require identity
-
-        String clean = normalize(path);
-        URI uri = URI.create(HOST + clean);
-
-        HttpRequest request = HttpRequest.newBuilder(uri)
-                .timeout(TIMEOUT)
-                .header("User-Agent", USER_AGENT)
-                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                .GET()
-                .build();
-
-        HttpResponse<InputStream> resp;
-        try
-        {
-            resp = CLIENT.send(request, HttpResponse.BodyHandlers.ofInputStream());
-        }
-        catch (Exception ex)
-        {
-            LOGGER.warning("wol fetch failed for '" + clean + "': " + ex);
-            throw new ApiException(org.springframework.http.HttpStatus.BAD_GATEWAY,
-                    "Upstream fetch failed: " + ex.getMessage());
-        }
-
-        if (resp.statusCode() < 200 || resp.statusCode() >= 300)
-        {
-            resp.body().close();
-            throw new ApiException(org.springframework.http.HttpStatus.BAD_GATEWAY,
-                    "Upstream returned HTTP " + resp.statusCode() + " for " + clean);
-        }
-
-        byte[] body;
-        try (InputStream in = resp.body())
-        {
-            body = readCapped(in);
-        }
-
-        LOGGER.info("wol fetch ok: " + clean + " (" + body.length + " bytes)");
+        String body = wol.fetchHtml(path);
         return ResponseEntity.ok()
                 .contentType(new MediaType(MediaType.TEXT_PLAIN, StandardCharsets.UTF_8))
                 .header(HttpHeaders.CACHE_CONTROL, "no-store")
-                .body(new String(body, StandardCharsets.UTF_8));
+                .body(body);
     }
 
-    /** Strip leading slashes; reject schemes and path traversal. The host is never caller-supplied. */
-    private static String normalize(String path)
+    @PostMapping("/wol/batch")
+    public ResponseEntity<Map<String, Object>> batch(
+            @RequestHeader(value = "X-User-Email", required = false) String email,
+            @RequestBody BatchRequest req)
     {
-        if (path == null || path.isBlank())
-        {
-            throw ApiException.badRequest("path is required");
-        }
-        String p = path.trim();
-        while (p.startsWith("/")) p = p.substring(1);
-        if (p.contains("://") || p.contains(".."))
-        {
-            throw ApiException.badRequest("Invalid path (no scheme or '..' allowed): " + path);
-        }
-        return p;
+        guard.requireEmail(email);
+        List<String> paths = req == null ? null : req.paths;
+        WolService.Job job = wol.startBatch(paths);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("jobId", job.id);
+        out.put("total", job.total);
+        return ResponseEntity.ok(out);
     }
 
-    /** Reads at most MAX_BYTES, throwing if the upstream body is larger. */
-    private static byte[] readCapped(InputStream in) throws Exception
+    @GetMapping("/wol/batch/{jobId}")
+    public ResponseEntity<Map<String, Object>> batchStatus(
+            @RequestHeader(value = "X-User-Email", required = false) String email,
+            @PathVariable("jobId") String jobId)
     {
-        byte[] out = in.readNBytes((int) MAX_BYTES + 1);
-        if (out.length > MAX_BYTES)
+        guard.requireEmail(email);
+        WolService.Job job = wol.getJob(jobId);
+        if (job == null)
         {
-            throw new ApiException(org.springframework.http.HttpStatus.BAD_GATEWAY,
-                    "Upstream response exceeds " + (MAX_BYTES / (1024 * 1024)) + "MB cap");
+            // The JVM was recycled (idle shutdown) or the job expired — tell the client to resubmit.
+            throw new ApiException(HttpStatus.GONE, "job not found (instance restarted)");
         }
-        return out;
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("done", job.done);
+        out.put("total", job.total);
+        out.put("finished", job.finished);
+        out.put("errors", job.errors);
+        // Keep the polling payload tiny: only ship the page bodies once, when the job is finished.
+        out.put("results", job.finished ? job.results : null);
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CACHE_CONTROL, "no-store")
+                .body(out);
+    }
+
+    @GetMapping("/wol/image")
+    public ResponseEntity<byte[]> image(
+            @RequestHeader(value = "X-User-Email", required = false) String email,
+            @RequestParam("path") String path)
+    {
+        guard.requireEmail(email);
+        WolService.Image img = wol.fetchImage(path);
+        MediaType type;
+        try { type = MediaType.parseMediaType(img.contentType); }
+        catch (Exception ex) { type = MediaType.IMAGE_JPEG; }
+        return ResponseEntity.ok()
+                .contentType(type)
+                .cacheControl(CacheControl.maxAge(7, TimeUnit.DAYS))
+                .body(img.bytes);
+    }
+
+    /** POST /wol/batch body. */
+    public static final class BatchRequest
+    {
+        public List<String> paths;
     }
 }

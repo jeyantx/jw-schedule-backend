@@ -20,6 +20,16 @@ public final class Catalyst
 
     private Catalyst() {}
 
+    /**
+     * Mark the current thread as the admin caller for the Catalyst SDK. The SDK reads this from a
+     * ThreadLocal, so any code touching Stratus/tables OFF a request thread (e.g. the wol batch
+     * worker) must call this first — otherwise the per-thread context is missing.
+     */
+    public static void asAdmin()
+    {
+        ZCThreadLocal.putValue(APIConstants.USER_TYPE, "admin");
+    }
+
     public static ZCSmartBrowz smartBrowz()
     {
         ZCThreadLocal.putValue(APIConstants.USER_TYPE, "admin");
