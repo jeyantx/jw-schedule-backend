@@ -2,6 +2,7 @@ package com.zoho.jw.schedule.store;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.zc.component.object.ZCRowObject;
 import com.zc.component.object.ZCTable;
 import com.zoho.jw.schedule.catalyst.Catalyst;
@@ -23,6 +24,11 @@ import java.util.Optional;
  *
  *   TJW_Congregation : NAME, CODE, OWNER_EMAIL, CREATED_AT
  *   TJW_Access       : CONGREGATION_ID, EMAIL, PERMISSIONS(json text), CREATED_AT
+ *
+ * The member's optional English name ({@code nameEn}) is folded into the PERMISSIONS json text
+ * under a reserved {@code "__nameEn"} key, so it needs NO new data-store column. It is split back
+ * out into a first-class field on read, so the {@code permissions} exposed to callers stays clean
+ * (area keys only).
  *   TJW_Data         : CONGREGATION_ID, KIND, PAYLOAD(json text), UPDATED_AT
  *
  * The schedule content itself lives as opaque JSON documents in TJW_Data (one row per
@@ -56,7 +62,7 @@ public class Store
         long id = rowId(saved);
 
         // The creator is the owner and gets full view+edit on every area.
-        grantAccess(id, ownerEmail, allAreasPermissions());
+        grantAccess(id, ownerEmail, allAreasPermissions(), null);
 
         return new Congregation(id, name, code, ownerEmail, now);
     }
@@ -99,10 +105,18 @@ public class Store
                 .findFirst().orElse(null);
     }
 
-    /** Grant or update one user's permissions on a congregation (owner action). */
-    public Access grantAccess(long congregationId, String email, JsonNode permissions) throws Exception
+    /** Grant or update one user's permissions (and optional English name) on a congregation. */
+    public Access grantAccess(long congregationId, String email, JsonNode permissions, String nameEn) throws Exception
     {
-        String permJson = JSON.writeValueAsString(permissions);
+        String cleanNameEn = (nameEn != null && !nameEn.isBlank()) ? nameEn.trim() : null;
+        // Fold nameEn into the PERMISSIONS json text (no dedicated column) under a reserved key.
+        ObjectNode toStore = (permissions != null && permissions.isObject())
+                ? ((ObjectNode) permissions).deepCopy()
+                : JSON.createObjectNode();
+        if (cleanNameEn != null) toStore.put("__nameEn", cleanNameEn);
+        String permJson = JSON.writeValueAsString(toStore);
+        // Caller-facing permissions stay clean (area keys only).
+        JsonNode cleanPerms = (permissions != null && permissions.isObject()) ? permissions : JSON.createObjectNode();
         Access existing = findAccess(congregationId, email);
 
         ZCTable table = table(TableIds.ACCESS);
@@ -112,7 +126,7 @@ public class Store
             row.set("ROWID", existing.id());
             row.set("PERMISSIONS", permJson);
             table.updateRows(List.of(row));
-            return new Access(existing.id(), congregationId, email, permissions);
+            return new Access(existing.id(), congregationId, email, cleanPerms, cleanNameEn);
         }
 
         ZCRowObject row = ZCRowObject.getInstance();
@@ -121,7 +135,7 @@ public class Store
         row.set("PERMISSIONS", permJson);
         row.set("CREATED_AT", System.currentTimeMillis());
         ZCRowObject saved = table.insertRow(row);
-        return new Access(rowId(saved), congregationId, email, permissions);
+        return new Access(rowId(saved), congregationId, email, cleanPerms, cleanNameEn);
     }
 
     public void revokeAccess(long congregationId, String email) throws Exception
@@ -241,10 +255,21 @@ public class Store
 
     private static Access toAccess(ZCRowObject r)
     {
-        JsonNode perms;
-        try { perms = JSON.readTree(str(r, "PERMISSIONS")); }
-        catch (Exception e) { perms = JSON.createObjectNode(); }
-        return new Access(rowId(r), asLong(r.get("CONGREGATION_ID")), str(r, "EMAIL"), perms);
+        JsonNode raw;
+        try { raw = JSON.readTree(str(r, "PERMISSIONS")); }
+        catch (Exception e) { raw = JSON.createObjectNode(); }
+
+        // Split the reserved "__nameEn" key back out so `permissions` stays area-only.
+        String nameEn = null;
+        JsonNode perms = raw;
+        if (raw != null && raw.isObject())
+        {
+            ObjectNode o = ((ObjectNode) raw).deepCopy();
+            JsonNode n = o.remove("__nameEn");
+            if (n != null && !n.isNull() && !n.asText().isBlank()) nameEn = n.asText();
+            perms = o;
+        }
+        return new Access(rowId(r), asLong(r.get("CONGREGATION_ID")), str(r, "EMAIL"), perms, nameEn);
     }
 
     private static long rowId(ZCRowObject r)

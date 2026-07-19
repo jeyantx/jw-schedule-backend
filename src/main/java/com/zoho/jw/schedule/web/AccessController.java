@@ -26,7 +26,7 @@ import java.util.Map;
 @RequestMapping("/congregations/{id}/access")
 public class AccessController
 {
-    public record GrantRequest(String email, JsonNode permissions) {}
+    public record GrantRequest(String email, JsonNode permissions, String nameEn) {}
 
     private final Store store;
     private final AccessGuard guard;
@@ -58,7 +58,7 @@ public class AccessController
             throw ApiException.badRequest("email is required");
         }
         JsonNode perms = req.permissions() != null ? req.permissions() : store.allAreasPermissions();
-        return store.grantAccess(id, req.email().trim(), perms);
+        return store.grantAccess(id, req.email().trim(), perms, req.nameEn());
     }
 
     @DeleteMapping

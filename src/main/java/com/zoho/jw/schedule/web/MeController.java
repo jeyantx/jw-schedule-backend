@@ -18,7 +18,7 @@ import java.util.List;
 @RestController
 public class MeController
 {
-    public record Membership(Congregation congregation, JsonNode permissions) {}
+    public record Membership(Congregation congregation, JsonNode permissions, String nameEn) {}
 
     private final Store store;
     private final AccessGuard guard;
@@ -37,7 +37,7 @@ public class MeController
         for (Access access : store.accessForEmail(caller))
         {
             store.getCongregation(access.congregationId())
-                    .ifPresent(c -> out.add(new Membership(c, access.permissions())));
+                    .ifPresent(c -> out.add(new Membership(c, access.permissions(), access.nameEn())));
         }
         return out;
     }
